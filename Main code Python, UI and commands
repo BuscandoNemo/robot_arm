@@ -1,0 +1,2166 @@
+import sys
+import math
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtSerialPort
+import json
+import os
+
+# -----------------------------
+# Global Config & Constants
+# -----------------------------
+DEBUG = False
+MOTOR_STATE_FILE = os.path.join(os.path.expanduser("~"), "Desktop", "robot_motor_positions.json")
+ANIM_DT_MS = 16                  # ~60 FPS
+MOTOR_RPM_MAX = 60.0             # speed cap
+BLINK_MS = 200                   # red blink period on limit error
+ANGLE_EPS = 0.6                  # deg — stop when within this deadband
+
+# Anti-twitch filter (direction flip watchdog)
+FILTER_WINDOW_S = 1.0            # sliding window
+FILTER_FLIPS_THRESHOLD = 3       # 3+ flips/sec triggers smoothing lock
+JITTER_DEG = 0.05                # ignore tiny cursor jitter (deg)
+
+# Smoothing buffer (coalesces micro deltas into steady moves)
+BUFFER_COMMIT_MS = 120           # commit buffered delta every ~120ms
+BUFFER_MIN_DEG = 2.0             # or when |buffer| exceeds 2 degrees
+
+def dlog(*args, **kwargs):
+    if DEBUG:
+        print("[DEBUG]", *args, **kwargs)
+
+# NEW: Helper functions for motor position persistence
+def load_motor_positions() -> dict:
+    """Load M4 and M5 positions from JSON file. Returns {4: degrees, 5: degrees}."""
+    if os.path.exists(MOTOR_STATE_FILE):
+        try:
+            with open(MOTOR_STATE_FILE, 'r') as f:
+                data = json.load(f)
+                return {4: float(data.get('M4', 0.0)), 5: float(data.get('M5', 0.0))}
+        except Exception as e:
+            if DEBUG:
+                print(f"[JSON] Failed to load {MOTOR_STATE_FILE}: {e}")
+            # File corrupted, recreate it
+            save_motor_positions(0.0, 0.0)
+            return {4: 0.0, 5: 0.0}
+    else:
+        # File doesn't exist, create it with zeros
+        save_motor_positions(0.0, 0.0)
+        if DEBUG:
+            print(f"[JSON] Created new file: {MOTOR_STATE_FILE}")
+        return {4: 0.0, 5: 0.0}
+
+def save_motor_positions(m4_deg: float, m5_deg: float) -> None:
+    """Save M4 and M5 positions to JSON file."""
+    try:
+        with open(MOTOR_STATE_FILE, 'w') as f:
+            json.dump({'M4': m4_deg, 'M5': m5_deg}, f, indent=2)
+        if DEBUG:
+            print(f"[JSON] Saved M4={m4_deg:.2f}°, M5={m5_deg:.2f}° to {MOTOR_STATE_FILE}")    
+    except Exception as e:
+        if DEBUG:
+            print(f"[JSON] Failed to save {MOTOR_STATE_FILE}: {e}")
+
+
+# ============================================================
+# 1) HAL
+# ============================================================
+
+class LampHAL:
+    def on(self, color: Tuple[int, int, int]) -> None: raise NotImplementedError
+    def off(self) -> None: raise NotImplementedError
+
+class StepperHAL:
+    CW  = 1
+    CCW = -1
+    def start(self, direction: int, rpm: float) -> None: raise NotImplementedError
+    def stop(self) -> None: raise NotImplementedError
+    def get_angle_deg(self) -> float: raise NotImplementedError  # CW+, 0..360
+
+class DeviceHAL:
+    def get_lamp(self, name: str) -> LampHAL: raise NotImplementedError
+    def get_stepper(self, name: str) -> StepperHAL: raise NotImplementedError
+
+# ============================================================
+# 2) Simulator Backend (GUI) implementing HAL
+# ============================================================
+
+class SimLampWidget(QtWidgets.QWidget, LampHAL):
+    _debug = False
+    def __init__(self, diameter: int = 100, label: str = "Lamp", parent=None):
+        super().__init__(parent)
+        self._diameter = diameter
+        self._on_color: Optional[Tuple[int,int,int]] = None
+        self._label = label
+        self.setMinimumSize(diameter + 24, diameter + 48)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+
+    def on(self, color: Tuple[int,int,int]) -> None:
+        if self._debug or DEBUG: dlog(f"{self._label}.on({color})")
+        self._on_color = color; self.update()
+
+    def off(self) -> None:
+        if self._debug or DEBUG: dlog(f"{self._label}.off()")
+        self._on_color = None; self.update()
+
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        if self._on_color is None:
+            fill = QtGui.QColor(55,55,55); edge = QtGui.QColor(25,25,25)
+        else:
+            r,g,b = self._on_color; fill = QtGui.QColor(r,g,b)
+            edge = QtGui.QColor(max(r-40,0), max(g-40,0), max(b-40,0))
+        p.setPen(QtGui.QPen(edge,2)); p.setBrush(QtGui.QBrush(fill))
+        R = self._diameter//2; cx = self.width()//2; cy = self.height()//2 - 12
+        rect = QtCore.QRect(cx-R, cy-R, self._diameter, self._diameter); p.drawEllipse(rect)
+        p.setPen(QtGui.QPen(QtGui.QColor(220,220,220)))
+        f = p.font(); f.setPointSize(11); p.setFont(f)
+        w = QtGui.QFontMetrics(f).horizontalAdvance(self._label)
+        p.drawText(int((self.width()-w)/2), self.height()-6, self._label)
+
+class SimStepperWidget(QtWidgets.QWidget, StepperHAL):
+    _debug = False
+    def __init__(self, diameter: int = 140, label: str = "Motor", parent=None):
+        super().__init__(parent)
+        self._diameter = diameter; self._label = label
+        self._running = False; self._direction = StepperHAL.CW
+        self._rpm = 0.0; self._angle_deg = 0.0
+        self._timer = QtCore.QTimer(self); self._timer.setInterval(ANIM_DT_MS)
+        self._timer.timeout.connect(self._on_tick)
+        self.setMinimumSize(diameter+28, diameter+56)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+
+        self._caption_override: Optional[str] = None
+
+    def start(self, direction: int, rpm: float) -> None:
+        """Idempotent start: no restart churn if dir/rpm unchanged."""
+        direction = StepperHAL.CW if direction >= 0 else StepperHAL.CCW
+        rpm = max(0.0, min(float(rpm), MOTOR_RPM_MAX))
+        if self._running and self._direction == direction and abs(self._rpm - rpm) < 1e-6:
+            return  # already running as requested
+        if self._debug or DEBUG: dlog(f"{self._label}.start(dir={direction}, rpm={rpm})")
+        self._direction = direction
+        self._rpm = rpm
+        self._running = self._rpm > 0.0
+        if self._running and not self._timer.isActive(): self._timer.start()
+        if not self._running and self._timer.isActive(): self._timer.stop()
+        self.update()
+
+    def stop(self) -> None:
+        if self._timer.isActive(): self._timer.stop()
+        self._running = False; self.update()
+
+    def get_angle_deg(self) -> float:
+        return float(self._angle_deg % 360.0)
+
+    def _on_tick(self) -> None:
+        if not self._running: return
+        dt = ANIM_DT_MS/1000.0; dps = 360.0*(self._rpm/60.0)
+        delta = dps*dt*(1 if self._direction==StepperHAL.CW else -1)
+        self._angle_deg = (self._angle_deg + delta) % 360.0
+        self.update()
+
+
+    def set_display_override(self, text: Optional[str]) -> None:
+        self._caption_override = text
+        self.update()
+
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        R = self._diameter//2; cx = self.width()//2; cy = self.height()//2 - 14
+        rect = QtCore.QRect(cx-R, cy-R, self._diameter, self._diameter)
+        p.setPen(QtGui.QPen(QtGui.QColor(40,40,45),3))
+        p.setBrush(QtGui.QBrush(QtGui.QColor(90,90,95))); p.drawEllipse(rect)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QBrush(QtGui.QColor(220,220,240) if self._running else QtGui.QColor(170,170,180)))
+        ang = math.radians(self._angle_deg); inner = R*0.12; tip = R*0.92
+        tipx = cx + tip*math.cos(ang); tipy = cy + tip*math.sin(ang)
+        lx = cx + inner*math.cos(ang + math.pi/2); ly = cy + inner*math.sin(ang + math.pi/2)
+        rx = cx + inner*math.cos(ang - math.pi/2); ry = cy + inner*math.sin(ang - math.pi/2)
+        poly = QtGui.QPolygonF([QtCore.QPointF(lx,ly), QtCore.QPointF(tipx,tipy), QtCore.QPointF(rx,ry)])
+        p.drawPolygon(poly)
+        p.setPen(QtGui.QPen(QtGui.QColor(230,230,230)))
+        f = p.font(); f.setPointSize(11); p.setFont(f)
+        if self._caption_override is not None:
+            text = f"{self._label} — {self._caption_override}"
+        else:
+            text = f"{self._label} — {self.get_angle_deg():6.1f}°"
+
+        w = QtGui.QFontMetrics(f).horizontalAdvance(text)
+        p.drawText(int((self.width()-w)/2), self.height()-6, text)
+
+class SimDevice(DeviceHAL):
+    def __init__(self):
+        self._lamps: dict[str, SimLampWidget] = {}
+        self._steppers: dict[str, SimStepperWidget] = {}
+    def register_lamp(self, name: str, lamp: SimLampWidget) -> None:
+        self._lamps[name] = lamp
+    def get_lamp(self, name: str) -> LampHAL:
+        return self._lamps[name]
+    def register_stepper(self, name: str, stepper: SimStepperWidget) -> None:
+        self._steppers[name] = stepper
+    def get_stepper(self, name: str) -> StepperHAL:
+        return self._steppers[name]
+
+# ============================================================
+# 3) Controller — drag + anti-twitch + buffered commits
+#     (unchanged motion logic; only signals added for logging)
+# ============================================================
+
+@dataclass
+class ControllerConfig:
+    lamp_green: str = "lamp_green"
+    lamp_red:   str = "lamp_red"
+    lamp_yellow: str = "lamp_yellow"   # smoothing indicator
+    lamp_blue:  str = "lamp_blue"      # gripper indicator
+    stepper_1:  str = "stepper_1"      # lower/base joint
+    stepper_2:  str = "stepper_2"      # upper/elbow joint
+    stepper_3:  str = "stepper_3"      # wrist/forearm joint
+    stepper_4:  str = "stepper_4"      # base yaw (horizontal rotation, ±360°)
+    stepper_5:  str = "stepper_5"      # gripper roll (spin, ±360°)
+    stepper_6:  str = "stepper_6"      # additional motor (no graphic input)
+    rpm_max: float = MOTOR_RPM_MAX
+    lower_limit_deg: float = 90.0      # ±90° from vertical (joint 1)
+    spin_limit_deg: float = 360.0
+
+class Controller(QtCore.QObject):
+    # ------- NEW: signals for the log panel -------
+    motor_command = QtCore.Signal(int, int, float)
+
+    motor_started = QtCore.Signal(int, int)  # (joint_idx 1..5, direction +1/-1)
+    motor_stopped = QtCore.Signal(int)       # joint_idx 1..5
+    grip_toggled  = QtCore.Signal(bool)      # True closed, False open
+    final_position = QtCore.Signal(int, float)  # (joint_idx 1..5, CW degrees 0..360)
+    limit_hit = QtCore.Signal(int, int, float)
+    centering_complete = QtCore.Signal()      
+    # ---------------------------------------------
+    
+    def command_delta_cw(self, joint: int, delta_deg_cw: float) -> None:
+        if joint not in (1, 2, 3, 4, 5, 6): return
+        if abs(delta_deg_cw) < 1e-9: return
+
+    # Map to internal CCW space (internal+ = CCW; dial/CW+)
+        ccw_delta = -float(delta_deg_cw)
+
+    # Pick fields for this joint
+        stepper = {1:self._s1, 2:self._s2, 3:self._s3, 4:self._s4, 5:self._s5, 6:self._s6}[joint]
+        target_attr = {1:'_target1', 2:'_target2', 3:'_target3', 4:'_target4', 5:'_target5', 6:'_target6'}[joint]
+        dir_attr    = {1:'_dir1',    2:'_dir2',    3:'_dir3',    4:'_dir4',    5:'_dir5',    6:'_dir6'}[joint]
+
+    # If we are currently blocked *and* this command goes the opposite way,
+    # clear the blink/limit freeze so the move can proceed.
+        dir_num_proposed = (1 if ccw_delta < 0 else -1)  # dial: CW=+1, CCW=-1
+        if (self._limit_violation and
+            self._limit_blocked_joint == joint and
+            self._limit_blocked_dir is not None and
+            dir_num_proposed == -self._limit_blocked_dir):
+            self._limit_violation = False
+            self._stop_blink(reset=True)
+            self._limit_blocked_joint = None
+            self._limit_blocked_dir = None
+
+    # Current continuous angle (internal CCW space)
+        cur_unwrapped = self._get_or_init_unwrapped(joint)
+        desired_unwrapped = cur_unwrapped + ccw_delta
+
+    
+
+    # Direction for control loop
+        direction = StepperHAL.CCW if (desired_unwrapped - cur_unwrapped) > 0 else StepperHAL.CW
+        setattr(self, dir_attr, direction)
+        setattr(self, target_attr, float(desired_unwrapped))
+
+    # Emit command for Arduino: absolute CW dial degrees to target
+        abs_cw = ((-desired_unwrapped) % 360.0)
+        dir_num = 1 if direction == StepperHAL.CW else -1
+        self.motor_command.emit(joint, dir_num, abs_cw)
+
+        if joint == 4:
+            self._m4_accumulated += delta_deg_cw
+            save_motor_positions(self._m4_accumulated, self._m5_accumulated)
+        elif joint == 5:
+            self._m5_accumulated += delta_deg_cw
+            save_motor_positions(self._m4_accumulated, self._m5_accumulated)
+
+
+
+
+        self._lamp_yellow.off()
+
+
+    def command_to_abs_cw(self, joint: int, desired_deg_cw: float) -> None:
+   
+    # map joint -> (stepper, target_attr, dir_attr)
+        step_map = {
+            1: (self._s1, '_target1', '_dir1'),
+            2: (self._s2, '_target2', '_dir2'),
+            3: (self._s3, '_target3', '_dir3'),
+            4: (self._s4, '_target4', '_dir4'),
+            5: (self._s5, '_target5', '_dir5'),
+            6: (self._s6, '_target6', '_dir6')
+        }
+        if joint not in step_map:
+            raise ValueError("joint must be 1..6")
+        stepper, target_attr, dir_attr = step_map[joint]
+
+    # current continuous (internal CCW)
+        cur_unwrapped = self._get_or_init_unwrapped(joint)
+
+    # desired in internal CCW modular space
+        desired_ccw_mod = self._cw_to_ccw(float(desired_deg_cw)) % 360.0
+        desired_unwrapped = self._nearest_equivalent(cur_unwrapped, desired_ccw_mod)
+
+   
+
+    # set direction & target
+        direction = StepperHAL.CCW if (desired_unwrapped - cur_unwrapped) > 0 else StepperHAL.CW
+        setattr(self, dir_attr, direction)
+        setattr(self, target_attr, float(desired_unwrapped))
+
+    # emit motor_command exactly like buffered commits do → Arduino 'M,...'
+        abs_cw = ((-desired_unwrapped) % 360.0)
+        dir_num = 1 if direction == StepperHAL.CW else -1
+        self.motor_command.emit(joint, dir_num, abs_cw)
+
+    
+
+    # numeric commands bypass smoothing indicator
+        self._lamp_yellow.off()
+
+    @QtCore.Slot()
+    def home_all_motors(self) -> None:
+        """
+        Drive all joints (1..5) back to neutral (0 internal CCW, i.e. dial = 0 CW)
+        so that:
+          - Motors 1,2,3 end up at 0 which represents center of their ±90° usable range.
+          - Motors 4,5 end up at 0 which represents center of their ±180° usable range.
+
+        We do NOT drag through the smoothing buffers. We directly set targets
+        and emit motor_command the same way command_to_abs_cw() / buffered commits do.
+        """
+        # clear any LIMIT blink/freeze so movement can happen
+        self._limit_violation = False
+        self._limit_blocked_joint = None
+        self._limit_blocked_dir = None
+        self._stop_blink(reset=True)
+
+        # flush all buffers so we don't fight pending partial moves
+        for j in (1,2,3,4,5,6):
+            self._flush_buffer(j)
+
+        # For every joint:
+        #   current unwrapped angle (internal CCW world)
+        #   target_unwrapped = 0.0
+        #   dir = CCW if 0 - cur > 0 else CW
+        #   clamp to limits where they exist (motor 1: ±90; motors 4/5: ±180)
+        for j in (1,2,3,4,5,6):
+            cur_unwrapped = self._get_or_init_unwrapped(j)
+            desired_unwrapped = 0.0
+
+            
+            # pick direction
+            direction = StepperHAL.CCW if (desired_unwrapped - cur_unwrapped) > 0 else StepperHAL.CW
+
+            # stash into that joint's target/dir fields exactly like command_to_abs_cw()
+            if j == 1:
+                self._dir1 = direction
+                self._target1 = desired_unwrapped
+            elif j == 2:
+                self._dir2 = direction
+                self._target2 = desired_unwrapped
+            elif j == 3:
+                self._dir3 = direction
+                self._target3 = desired_unwrapped
+            elif j == 4:
+                self._dir4 = direction
+                self._target4 = desired_unwrapped
+            elif j == 5:
+                self._dir5 = direction
+                self._target5 = desired_unwrapped
+            else:  # j == 6
+                self._dir6 = direction
+                self._target6 = desired_unwrapped
+
+            # tell Arduino using same protocol:
+            # abs_cw = (-desired_unwrapped) % 360
+            abs_cw = ((-desired_unwrapped) % 360.0)
+            dir_num = 1 if direction == StepperHAL.CW else -1
+            self.motor_command.emit(j, dir_num, abs_cw)
+
+        # smoothing lamp is not part of this maneuver
+        self._lamp_yellow.off()
+
+
+    @QtCore.Slot()
+    def reset_m23_ccw_360(self) -> None:
+        """
+        Command Motors 2 & 3 to go CCW by 360° from wherever they are now,
+        in one shot. Emits motor_command so Arduino gets the absolute target.
+        """
+        # clear any LIMIT blink state; joints 2/3 have no hard limits anyway
+        self._limit_violation = False
+        self._limit_blocked_joint: Optional[int] = None
+        self._limit_blocked_dir: Optional[int] = None  # +1 = CW, -1 = CCW (dial convention)
+        self._stop_blink(reset=True)
+
+        # flush smoothing buffers for 2 and 3
+        self._flush_buffer(2)
+        self._flush_buffer(3)
+
+        # current continuous angles (internal CCW space)
+        c2 = self._get_or_init_unwrapped(2)
+        c3 = self._get_or_init_unwrapped(3)
+
+        # set targets and directions
+        self._dir2 = StepperHAL.CCW; self._target2 = c2 + 360.0
+        self._dir3 = StepperHAL.CCW; self._target3 = c3 + 360.0
+
+        # mirror your normal commit signal so Arduino gets a command
+        self.motor_command.emit(2, -1, (self._target2 % 360.0))
+        self.motor_command.emit(3, -1, (self._target3 % 360.0))
+
+        # smoothing lamp off (this is a direct command)
+        self._lamp_yellow.off()
+
+    def __init__(self, device: DeviceHAL, cfg: ControllerConfig):
+        super().__init__()
+        self._dev = device; self._cfg = cfg
+        self._lamp_green:  LampHAL = device.get_lamp(cfg.lamp_green)
+        self._lamp_red:    LampHAL = device.get_lamp(cfg.lamp_red)
+        self._lamp_yellow: LampHAL = device.get_lamp(cfg.lamp_yellow)
+        self._lamp_blue:   LampHAL = device.get_lamp(cfg.lamp_blue)
+        self._s1: StepperHAL = device.get_stepper(cfg.stepper_1)
+        self._s2: StepperHAL = device.get_stepper(cfg.stepper_2)
+        self._s3: StepperHAL = device.get_stepper(cfg.stepper_3)
+        self._s4: StepperHAL = device.get_stepper(cfg.stepper_4)  # base yaw
+        self._s5: StepperHAL = device.get_stepper(cfg.stepper_5)  # gripper roll
+        self._s6: StepperHAL = device.get_stepper(cfg.stepper_6)
+
+        # Continuous (unwrapped) angles
+        self._cur1_unwrap: Optional[float] = None
+        self._cur2_unwrap: Optional[float] = None
+        self._cur3_unwrap: Optional[float] = None
+        self._cur4_unwrap: Optional[float] = None
+        self._cur5_unwrap: Optional[float] = None
+        self._cur6_unwrap: Optional[float] = None
+
+        # Drag state, targets and directions
+        self._drag_active1 = False; self._drag_active2 = False; self._drag_active3 = False
+        self._drag_active4 = False; self._drag_active5 = False
+        self._target1: Optional[float] = None
+        self._target2: Optional[float] = None
+        self._target3: Optional[float] = None
+        self._target4: Optional[float] = None
+        self._target5: Optional[float] = None
+        self._target6: Optional[float] = None
+        self._dir1: Optional[int] = None
+        self._dir2: Optional[int] = None
+        self._dir3: Optional[int] = None
+        self._dir4: Optional[int] = None
+        self._dir5: Optional[int] = None
+        self._dir6: Optional[int] = None
+        self._last_cursor1: Optional[float] = None
+        self._last_cursor2: Optional[float] = None
+        self._last_cursor3: Optional[float] = None
+        self._last_cursor4: Optional[float] = None
+        self._last_cursor5: Optional[float] = None
+        self._last_cursor6: Optional[float] = None
+
+        # Anti-twitch direction flip tracking
+        self._flips1: List[float] = []; self._locked1 = False
+        self._flips2: List[float] = []; self._locked2 = False
+        self._flips3: List[float] = []; self._locked3 = False
+        self._flips4: List[float] = []; self._locked4 = False
+        self._flips5: List[float] = []; self._locked5 = False
+        self._flips6: List[float] = []; self._locked6 = False
+
+        # Smoothing buffers (per joint)
+        self._buf1_sum = 0.0; self._buf1_ts = 0.0; self._buf1_dir: Optional[int] = None
+        self._buf2_sum = 0.0; self._buf2_ts = 0.0; self._buf2_dir: Optional[int] = None
+        self._buf3_sum = 0.0; self._buf3_ts = 0.0; self._buf3_dir: Optional[int] = None
+        self._buf4_sum = 0.0; self._buf4_ts = 0.0; self._buf4_dir: Optional[int] = None
+        self._buf5_sum = 0.0; self._buf5_ts = 0.0; self._buf5_dir: Optional[int] = None
+        self._buf6_sum = 0.0; self._buf6_ts = 0.0; self._buf6_dir: Optional[int] = None
+
+        # Limit blink (any violating joint triggers same red blink & freeze)
+        self._blink = QtCore.QTimer(self); self._blink.setInterval(BLINK_MS)
+        self._blink.timeout.connect(self._toggle_red)
+        self._red_on_for_blink = False
+        self._limit_violation = False
+
+        # Gripper state / colors
+        self._grip_closed = False
+        self._BLUE = (65,150,255)
+        self._GREEN = (0,200,70); self._RED = (220,40,40); self._YELLOW = (240,210,20)
+
+        self._loop = QtCore.QTimer(self); self._loop.setInterval(ANIM_DT_MS)
+        self._loop.timeout.connect(self._control_tick); self._loop.start()
+
+        self._lamp_blue.off()
+        self._all_off_and_stop()
+
+        # --- state trackers for logging starts/stops ---
+        self._was_running = [False, False, False, False, False, False]
+        self._stop_pending: List[Optional[float]] = [None, None, None, None, None, None]
+
+        # NEW: debounce helpers
+        self._limit_reported = [False, False, False, False, False, False]  # only one LIMIT per drag
+        self._last_motion_ts = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  
+
+        self._m4_accumulated = 0.0
+        self._m5_accumulated = 0.0
+
+
+    @QtCore.Slot()
+    def auto_center_all(self) -> None:
+        """
+        Auto-center motors 2 & 3 on startup:
+        1. Spin CCW to -180° limit (left limit)
+        2. Then spin CW by +90° to reach center (-90°)
+        """
+        # Clear any LIMIT state
+        self._limit_violation = False
+        self._limit_blocked_joint = None
+        self._limit_blocked_dir = None
+        self._stop_blink(reset=True)
+
+        # Flush buffers for motors 2 & 3
+        self._flush_buffer(2)
+        self._flush_buffer(3)
+        self._flush_buffer(4)
+        self._flush_buffer(5)
+
+        # NEW: Load M4/M5 positions from JSON
+        positions = load_motor_positions()
+        self._m4_accumulated = positions[4]
+        self._m5_accumulated = positions[5]
+
+        # Stage 1: Command both to go to -180° (CCW limit)
+        self._dir2 = StepperHAL.CCW
+        self._target2 = -180.0
+        self._dir3 = StepperHAL.CCW
+        self._target3 = -180.0
+
+        # Emit commands for Arduino
+        self.motor_command.emit(2, 1, 180.0)  # -180° internal = 180° CW dial
+        self.motor_command.emit(3, 1, 180.0)
+
+        # NEW: M4 & M5 return to 0° (negative of accumulated position)
+        if abs(self._m4_accumulated) > 0.1:  # Only move if not already at 0
+            self.command_delta_cw(4, -self._m4_accumulated)
+        if abs(self._m5_accumulated) > 0.1:
+            self.command_delta_cw(5, -self._m5_accumulated)
+
+        self._centering_active = True
+        self._centering_stage2_done = False 
+
+        def _stage2():
+            # Only run if centering is still active (defensive in case you add cancels later)
+            if not getattr(self, "_centering_active", False):
+                return
+
+            # target "true center": internal -90.0 (which equals 90° CW dial)
+            self._dir2 = StepperHAL.CW
+            self._target2 = -90.0
+            self._dir3 = StepperHAL.CW
+            self._target3 = -90.0
+
+            # tell Arduino new absolute CW dial targets
+            self.motor_command.emit(2, -1, 90.0)   # dir_num 1 means CW, 90 CW dial degrees
+            self.motor_command.emit(3, -1, 90.0)
+
+        # schedule stage2 in 1500 ms
+        QtCore.QTimer.singleShot(1500, _stage2)
+
+        # yellow filter lamp should not light just because of scripted centering
+        self._lamp_yellow.off()
+
+        def _check_centering_progress(self) -> None:
+       
+            return
+
+    # --------- Gripper public API ----------
+    def toggle_gripper(self) -> None:
+        self._grip_closed = not self._grip_closed
+        if self._grip_closed: self._lamp_blue.on(self._BLUE)
+        else: self._lamp_blue.off()
+        self.grip_toggled.emit(self._grip_closed)  # <-- log event
+    
+
+    def is_gripper_closed(self) -> bool:
+        return self._grip_closed
+
+    # ---------------- Drag API ----------------
+    def start_drag_lower(self) -> None:
+        self._drag_active1 = True
+        self._dir1 = None; self._last_cursor1 = None
+        self._locked1 = False; self._flips1.clear()
+        self._buf1_sum = 0.0; self._buf1_dir = None; self._buf1_ts = time.time()
+        self._limit_violation = False; self._stop_blink(reset=True)
+        self._limit_reported[0] = False  # NEW: allow one LIMIT emit for Motor 1
+        
+
+    def start_drag_upper(self) -> None:
+        self._drag_active2 = True
+        self._dir2 = None; self._last_cursor2 = None
+        self._locked2 = False; self._flips2.clear()
+        self._buf2_sum = 0.0; self._buf2_dir = None; self._buf2_ts = time.time()
+
+    def start_drag_wrist(self) -> None:
+        self._drag_active3 = True
+        self._dir3 = None; self._last_cursor3 = None
+        self._locked3 = False; self._flips3.clear()
+        self._buf3_sum = 0.0; self._buf3_dir = None; self._buf3_ts = time.time()
+        self._limit_violation = False; self._stop_blink(reset=True)
+
+    def start_drag_yaw(self) -> None:
+        self._drag_active4 = True
+        self._dir4 = None; self._last_cursor4 = None
+        self._locked4 = False; self._flips4.clear()
+        self._buf4_sum = 0.0; self._buf4_dir = None; self._buf4_ts = time.time()
+        self._limit_violation = False; self._stop_blink(reset=True)
+
+    def start_drag_roll(self) -> None:
+        self._drag_active5 = True
+        self._dir5 = None; self._last_cursor5 = None
+        self._locked5 = False; self._flips5.clear()
+        self._buf5_sum = 0.0; self._buf5_dir = None; self._buf5_ts = time.time()
+        self._limit_violation = False; self._stop_blink(reset=True)
+        self._limit_reported[4] = False  
+
+    def update_cursor_lower(self, theta1_deg_mod: float) -> None:
+       
+
+        self._update_from_cursor(
+            joint=1, new_cursor_mod=theta1_deg_mod,
+            flips=self._flips1, locked_attr='_locked1',
+            dir_attr='_dir1', last_cursor_attr='_last_cursor1',
+            target_attr='_target1',
+            buf_sum_attr='_buf1_sum', buf_dir_attr='_buf1_dir', buf_ts_attr='_buf1_ts',
+            limit_joint1=True
+        )
+
+    def update_cursor_upper(self, theta2_deg_mod: float) -> None:
+        self._update_from_cursor(
+            joint=2, new_cursor_mod=theta2_deg_mod,
+            flips=self._flips2, locked_attr='_locked2',
+            dir_attr='_dir2', last_cursor_attr='_last_cursor2',
+            target_attr='_target2',
+            buf_sum_attr='_buf2_sum', buf_dir_attr='_buf2_dir', buf_ts_attr='_buf2_ts',
+            limit_joint1=False
+        )
+
+    def update_cursor_wrist(self, theta3_deg_mod: float) -> None:
+        self._update_from_cursor(
+            joint=3, new_cursor_mod=theta3_deg_mod,
+            flips=self._flips3, locked_attr='_locked3',
+            dir_attr='_dir3', last_cursor_attr='_last_cursor3',
+            target_attr='_target3',
+            buf_sum_attr='_buf3_sum', buf_dir_attr='_buf3_dir', buf_ts_attr='_buf3_ts',
+            limit_joint1=False
+        )
+
+    def update_cursor_yaw(self, theta4_deg_mod: float) -> None:
+       
+            
+
+        self._update_from_cursor(
+            joint=4, new_cursor_mod=theta4_deg_mod,
+            flips=self._flips4, locked_attr='_locked4',
+            dir_attr='_dir4', last_cursor_attr='_last_cursor4',
+            target_attr='_target4',
+            buf_sum_attr='_buf4_sum', buf_dir_attr='_buf4_dir', buf_ts_attr='_buf4_ts',
+            limit_joint1=False
+        )
+
+    def update_cursor_roll(self, theta5_deg_mod: float) -> None:
+
+        self._update_from_cursor(
+            joint=5, new_cursor_mod=theta5_deg_mod,
+            flips=self._flips5, locked_attr='_locked5',
+            dir_attr='_dir5', last_cursor_attr='_last_cursor5',
+            target_attr='_target5',
+            buf_sum_attr='_buf5_sum', buf_dir_attr='_buf5_dir', buf_ts_attr='_buf5_ts',
+            limit_joint1=False
+        )
+
+    def end_drag(self) -> None:
+        # Flush any remaining buffer to the targets, then hold pose
+        for j in (1,2,3,4,5,6): self._flush_buffer(j)
+        self._drag_active1 = self._drag_active2 = self._drag_active3 = False
+        self._drag_active4 = self._drag_active5 = self._drag_active6 = False
+        self._dir1 = self._dir2 = self._dir3 = None
+        self._dir4 = self._dir5 = self._dir6 = None
+        self._last_cursor1 = self._last_cursor2 = self._last_cursor3 = None
+        self._last_cursor4 = self._last_cursor5 = self._last_cursor6 = None
+        self._locked1 = self._locked2 = self._locked3 = False
+        self._locked4 = self._locked5 = self._locked6 = False
+        self._flips1.clear(); self._flips2.clear(); self._flips3.clear()
+        self._flips4.clear(); self._flips5.clear(); self._flips6.clear()
+        self._buf1_sum = self._buf2_sum = self._buf3_sum = 0.0
+        self._buf4_sum = self._buf5_sum = self._buf6_sum = 0.0
+        self._buf1_dir = self._buf2_dir = self._buf3_dir = None
+        self._buf4_dir = self._buf5_dir = self._buf6_dir = None
+        self._lamp_yellow.off()
+        self._limit_violation = False; self._stop_blink(reset=True)
+        self._limit_reported = [False, False, False, False, False, False]  # NEW
+        self._all_off_and_stop()
+
+    # ---------------- Internal: cursor → direction/commit via buffer -----------
+    def _update_from_cursor(self, joint: int, new_cursor_mod: float, flips: List[float],
+                            locked_attr: str, dir_attr: str, last_cursor_attr: str, target_attr: str,
+                            buf_sum_attr: str, buf_dir_attr: str, buf_ts_attr: str,
+                            limit_joint1: bool) -> None:
+        now = time.time()
+        cur_unwrapped = self._get_or_init_unwrapped(joint)
+        cursor_unwrapped = self._nearest_equivalent(cur_unwrapped, new_cursor_mod)
+
+        last_cursor = getattr(self, last_cursor_attr)
+        current_dir = getattr(self, dir_attr)
+        locked = getattr(self, locked_attr)
+
+        # Proposed direction from cursor delta
+        if last_cursor is None:
+            delta_mod = self._shortest_ccw_diff(cur_unwrapped % 360.0, new_cursor_mod % 360.0)
+        else:
+            delta_mod = self._shortest_ccw_diff(last_cursor % 360.0, new_cursor_mod % 360.0)
+
+        proposed = None
+        if abs(delta_mod) >= JITTER_DEG:
+            proposed = StepperHAL.CCW if delta_mod > 0 else StepperHAL.CW
+
+        # Flip counting (anti-twitch) — only when unlocked
+        if proposed is not None and current_dir is not None and proposed != current_dir and not locked:
+            flips.append(now)
+            while flips and (now - flips[0]) > FILTER_WINDOW_S:
+                flips.pop(0)
+            if len(flips) >= FILTER_FLIPS_THRESHOLD:
+                locked = True
+                setattr(self, locked_attr, True)
+
+        # Direction update (respect lock)
+        if not locked and proposed is not None and proposed != current_dir:
+            setattr(self, dir_attr, proposed)
+            current_dir = proposed
+            # Direction changed → flush buffer in old dir before switching
+            self._flush_buffer(joint)
+
+        # Initialize dir if still None
+        if current_dir is None and proposed is not None:
+            setattr(self, dir_attr, proposed)
+            current_dir = proposed
+
+        # Buffer accumulation: add delta toward cursor in active direction
+        if current_dir is not None:
+            buf_sum = getattr(self, buf_sum_attr)
+            buf_dir = getattr(self, buf_dir_attr)
+            buf_ts  = getattr(self, buf_ts_attr) or now
+
+            # If buffer dir mismatches current dir, flush and switch dir
+            if buf_dir is not None and buf_dir != current_dir and abs(buf_sum) > 0.0:
+                self._flush_buffer(joint)
+                buf_sum = 0.0; buf_dir = current_dir; buf_ts = now
+
+            if buf_dir is None:
+                buf_dir = current_dir
+                buf_ts = now
+
+            # Compute desired delta from current motor to cursor (unwrapped)
+            delta_to_cursor = (cursor_unwrapped - cur_unwrapped) if current_dir == StepperHAL.CCW else (cur_unwrapped - cursor_unwrapped)
+            # Only accumulate positive (forward) progress in the chosen dir
+            if delta_to_cursor > 0:
+                buf_sum += delta_to_cursor
+
+            # Commit conditions: time or magnitude
+            elapsed_ms = (now - buf_ts) * 1000.0
+            if buf_sum >= BUFFER_MIN_DEG or elapsed_ms >= BUFFER_COMMIT_MS:
+                # Extend (or create) target by the buffered amount in current_dir
+                target = getattr(self, target_attr)
+                if target is None:
+                    target = cur_unwrapped + (buf_sum if current_dir == StepperHAL.CCW else -buf_sum)
+                else:
+                    target += (buf_sum if current_dir == StepperHAL.CCW else -buf_sum)
+
+            
+
+                setattr(self, target_attr, target)
+
+                # ---- NEW: emit a "command committed" event for logs ----
+                abs_deg = (target % 360.0)
+                dir_num = 1 if current_dir == StepperHAL.CW else -1
+                self.motor_command.emit(joint, dir_num, abs_deg)
+
+                # Reset buffer timestamp but keep direction (continue accumulating)
+                buf_sum = 0.0
+                buf_ts = now
+
+            # Save buffer state back
+            setattr(self, buf_sum_attr, buf_sum)
+            setattr(self, buf_dir_attr, buf_dir)
+            setattr(self, buf_ts_attr, buf_ts)
+
+        # Yellow lamp if smoothing lock or buffer content is present
+        smoothing_active = (
+            self._locked1 or self._locked2 or self._locked3 or self._locked4 or self._locked5 or
+            abs(self._buf1_sum) > 0.0 or abs(self._buf2_sum) > 0.0 or
+            abs(self._buf3_sum) > 0.0 or abs(self._buf4_sum) > 0.0 or abs(self._buf5_sum) > 0.0
+        )
+        self._lamp_yellow.on(self._YELLOW) if smoothing_active else self._lamp_yellow.off()
+
+        # Update last cursor
+        setattr(self, last_cursor_attr, new_cursor_mod)
+
+    def _flush_buffer(self, which: int) -> None:
+        """Commit any buffered delta immediately (used on dir change/end-drag)."""
+        if which == 1:
+            buf_sum, buf_dir = self._buf1_sum, self._buf1_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(1)
+                target = self._target1 if self._target1 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+                # enforce limit
+               
+                self._target1 = target
+                self.motor_command.emit(1, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+
+            self._buf1_sum = 0.0; self._buf1_dir = None; self._buf1_ts = time.time()
+        elif which == 2:
+            buf_sum, buf_dir = self._buf2_sum, self._buf2_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(2)
+                target = self._target2 if self._target2 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+                self._target2 = target
+                self.motor_command.emit(2, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+
+            self._buf2_sum = 0.0; self._buf2_dir = None; self._buf2_ts = time.time()
+        elif which == 3:
+            buf_sum, buf_dir = self._buf3_sum, self._buf3_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(3)
+                target = self._target3 if self._target3 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+                self._target3 = target
+
+                self.motor_command.emit(3, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+            self._buf3_sum = 0.0; self._buf3_dir = None; self._buf3_ts = time.time()
+        elif which == 4:
+            buf_sum, buf_dir = self._buf4_sum, self._buf4_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(4)
+                target = self._target4 if self._target4 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+               
+                self._target4 = target
+
+                self.motor_command.emit(4, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+            self._buf4_sum = 0.0; self._buf4_dir = None; self._buf4_ts = time.time()
+        elif which == 5:
+            buf_sum, buf_dir = self._buf5_sum, self._buf5_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(5)
+                target = self._target5 if self._target5 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+            
+                self._target5 = target
+
+                self.motor_command.emit(5, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+            self._buf5_sum = 0.0; self._buf5_dir = None; self._buf5_ts = time.time()
+        else:  # which == 6
+            buf_sum, buf_dir = self._buf6_sum, self._buf6_dir
+            if buf_dir is not None and buf_sum > 0.0:
+                cur = self._get_or_init_unwrapped(6)
+                target = self._target6 if self._target6 is not None else cur
+                target += (buf_sum if buf_dir == StepperHAL.CCW else -buf_sum)
+                self._target6 = target
+
+                self.motor_command.emit(6, (1 if buf_dir == StepperHAL.CW else -1), (target % 360.0))
+            self._buf6_sum = 0.0; self._buf6_dir = None; self._buf6_ts = time.time()
+
+    # ---------------- Control loop ----------------
+    def _control_tick(self) -> None:
+        # Update unwrapped currents
+        c1 = self._update_unwrapped(1, self._s1.get_angle_deg())
+        c2 = self._update_unwrapped(2, self._s2.get_angle_deg())
+        c3 = self._update_unwrapped(3, self._s3.get_angle_deg())
+        c4 = self._update_unwrapped(4, self._s4.get_angle_deg())
+        c5 = self._update_unwrapped(5, self._s5.get_angle_deg())
+        c6 = self._update_unwrapped(6, self._s6.get_angle_deg())
+
+        if self._limit_violation:
+
+            self._s1.stop(); self._s2.stop(); self._s3.stop(); self._s4.stop(); self._s5.stop(); self._s6.stop()
+            self._lamp_green.off()
+            return
+
+        moving = False; green_on = False; red_on = False
+
+        # Track running state for log events
+        now = time.time()  
+        prev = self._was_running[:]  # copy
+        running_now = [False, False, False, False, False, False] 
+
+        def mark_change(idx: int, is_running: bool, dirv: Optional[int]):
+            if is_running and not prev[idx-1]:
+                # Only emit START if we were idle for ≥1s
+                if (now - self._last_motion_ts[idx-1]) >= 1.0:
+                    self.motor_started.emit(idx, +1 if (dirv == StepperHAL.CW) else -1)
+            if (not is_running) and prev[idx-1]:
+                self.motor_stopped.emit(idx)
+            self._was_running[idx-1] = is_running
+            running_now[idx-1] = is_running
+            if is_running:
+                self._last_motion_ts[idx-1] = now   
+
+        # Joint 1
+        if self._target1 is not None and self._dir1 is not None:
+            remaining = (self._target1 - c1) if self._dir1 == StepperHAL.CCW else (c1 - self._target1)
+            if remaining <= ANGLE_EPS:
+                self._s1.stop(); self._target1 = None; mark_change(1, False, None)
+            else:
+                self._s1.start(self._dir1, self._cfg.rpm_max); mark_change(1, True, self._dir1)
+                moving = True; green_on |= (self._dir1==StepperHAL.CCW); red_on |= (self._dir1==StepperHAL.CW)
+        else:
+            self._s1.stop(); mark_change(1, False, None)
+
+        # Joint 2
+        if self._target2 is not None and self._dir2 is not None:
+            remaining2 = (self._target2 - c2) if self._dir2 == StepperHAL.CCW else (c2 - self._target2)
+            if remaining2 <= ANGLE_EPS:
+                self._s2.stop(); self._target2 = None; mark_change(2, False, None)
+            else:
+                self._s2.start(self._dir2, self._cfg.rpm_max); mark_change(2, True, self._dir2)
+                moving = True; green_on |= (self._dir2==StepperHAL.CCW); red_on |= (self._dir2==StepperHAL.CW)
+        else:
+            self._s2.stop(); mark_change(2, False, None)
+
+        # Joint 3
+        if self._target3 is not None and self._dir3 is not None:
+            remaining3 = (self._target3 - c3) if self._dir3 == StepperHAL.CCW else (c3 - self._target3)
+            if remaining3 <= ANGLE_EPS:
+                self._s3.stop(); self._target3 = None; mark_change(3, False, None)
+            else:
+                self._s3.start(self._dir3, self._cfg.rpm_max); mark_change(3, True, self._dir3)
+                moving = True; green_on |= (self._dir3==StepperHAL.CCW); red_on |= (self._dir3==StepperHAL.CW)
+        else:
+            self._s3.stop(); mark_change(3, False, None)
+
+        # Joint 4
+        if self._target4 is not None and self._dir4 is not None:
+            remaining4 = (self._target4 - c4) if self._dir4 == StepperHAL.CCW else (c4 - self._target4)
+            if remaining4 <= ANGLE_EPS:
+                self._s4.stop(); self._target4 = None; mark_change(4, False, None)
+            else:
+                self._s4.start(self._dir4, self._cfg.rpm_max); mark_change(4, True, self._dir4)
+                moving = True; green_on |= (self._dir4==StepperHAL.CCW); red_on |= (self._dir4==StepperHAL.CW)
+        else:
+            self._s4.stop(); mark_change(4, False, None)
+
+        # Joint 5
+        if self._target5 is not None and self._dir5 is not None:
+            remaining5 = (self._target5 - c5) if self._dir5 == StepperHAL.CCW else (c5 - self._target5)
+            if remaining5 <= ANGLE_EPS:
+                self._s5.stop(); self._target5 = None; mark_change(5, False, None)
+            else:
+                self._s5.start(self._dir5, self._cfg.rpm_max); mark_change(5, True, self._dir5)
+                moving = True; green_on |= (self._dir5==StepperHAL.CCW); red_on |= (self._dir5==StepperHAL.CW)
+        else:
+            self._s5.stop(); mark_change(5, False, None)
+
+
+        # Joint 6
+        if self._target6 is not None and self._dir6 is not None:
+            remaining6 = (self._target6 - c6) if self._dir6 == StepperHAL.CCW else (c6 - self._target6)
+            if remaining6 <= ANGLE_EPS:
+                self._s6.stop(); self._target6 = None; mark_change(6, False, None)
+            else:
+                self._s6.start(self._dir6, self._cfg.rpm_max); mark_change(6, True, self._dir6)
+                moving = True; green_on |= (self._dir6==StepperHAL.CCW); red_on |= (self._dir6==StepperHAL.CW)
+        else:
+            self._s6.stop(); mark_change(6, False, None)
+
+        self._service_idle_emit(running_now)
+        
+        # Lamps
+        if moving:
+            self._lamp_green.on(self._GREEN) if green_on else self._lamp_green.off()
+            self._lamp_red.on(self._RED) if red_on else self._lamp_red.off()
+        else:
+            self._lamp_green.off(); self._lamp_red.off()
+
+        if not self._limit_violation:
+            self._stop_blink(reset=False)
+
+        # --- NEW: when a joint remains stopped for >1s, emit its final dial angle ---
+    def _service_idle_emit(self, running_now: List[bool]) -> None:
+        now = time.time()
+        steppers = [self._s1, self._s2, self._s3, self._s4, self._s5, self._s6]
+        for i in range(6):
+            if running_now[i]:
+                # moving → cancel any pending “final” emission
+                self._stop_pending[i] = None
+            else:
+                ts = self._stop_pending[i]
+                if ts is None:
+                    # just became idle → start the 1s timer
+                    self._stop_pending[i] = now
+                elif ts != float("inf") and (now - ts) >= 1.0:
+                    # idle long enough → emit final angle shown on dial (CW degrees)
+                    deg_cw = steppers[i].get_angle_deg()
+                    self.final_position.emit(i + 1, deg_cw)
+                    # lock until movement resumes so we don't emit repeatedly
+                    self._stop_pending[i] = float("inf")
+        if getattr(self, "_centering_active", False):
+            if getattr(self, "_centering_stage2_done", False):
+                m2_idle_done = (self._stop_pending[1] == float("inf"))  # index 1 -> motor 2
+                m3_idle_done = (self._stop_pending[2] == float("inf"))  # index 2 -> motor 3
+                if m2_idle_done and m3_idle_done:
+                # both have reached their final settled pose after the scripted moves
+                    self._centering_active = False  # clear the flag
+                    self.centering_complete.emit()
+
+    # ---------------- Helpers ----------------
+    def _get_or_init_unwrapped(self, which: int) -> float:
+        if which == 1:
+            deg = self._s1.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur1_unwrap is None: self._cur1_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur1_unwrap % 360.0, cur_mod)
+                self._cur1_unwrap += delta
+            return self._cur1_unwrap
+        elif which == 2:
+            deg = self._s2.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur2_unwrap is None: self._cur2_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur2_unwrap % 360.0, cur_mod)
+                self._cur2_unwrap += delta
+            return self._cur2_unwrap
+        elif which == 3:
+            deg = self._s3.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur3_unwrap is None: self._cur3_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur3_unwrap % 360.0, cur_mod)
+                self._cur3_unwrap += delta
+            return self._cur3_unwrap
+        elif which == 4:
+            deg = self._s4.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur4_unwrap is None: self._cur4_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur4_unwrap % 360.0, cur_mod)
+                self._cur4_unwrap += delta
+            return self._cur4_unwrap
+        elif which == 5:
+            deg = self._s5.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur5_unwrap is None: self._cur5_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur5_unwrap % 360.0, cur_mod)
+                self._cur5_unwrap += delta
+            return self._cur5_unwrap
+        else: # which == 6:
+            deg = self._s6.get_angle_deg(); cur_mod = self._cw_to_ccw(deg)
+            if self._cur6_unwrap is None: self._cur6_unwrap = cur_mod
+            else:
+                delta = self._shortest_ccw_diff(self._cur6_unwrap % 360.0, cur_mod)
+                self._cur6_unwrap += delta
+            return self._cur6_unwrap
+
+    def _update_unwrapped(self, which: int, cw_deg: float) -> float:
+        ccw_mod = self._cw_to_ccw(cw_deg)
+        if which == 1:
+            if self._cur1_unwrap is None: self._cur1_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur1_unwrap % 360.0, ccw_mod)
+            self._cur1_unwrap += delta; return self._cur1_unwrap
+        elif which == 2:
+            if self._cur2_unwrap is None: self._cur2_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur2_unwrap % 360.0, ccw_mod)
+            self._cur2_unwrap += delta; return self._cur2_unwrap
+        elif which == 3:
+            if self._cur3_unwrap is None: self._cur3_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur3_unwrap % 360.0, ccw_mod)
+            self._cur3_unwrap += delta; return self._cur3_unwrap
+        elif which == 4:
+            if self._cur4_unwrap is None: self._cur4_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur4_unwrap % 360.0, ccw_mod)
+            self._cur4_unwrap += delta; return self._cur4_unwrap
+        elif which == 5:
+            if self._cur5_unwrap is None: self._cur5_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur5_unwrap % 360.0, ccw_mod)
+            self._cur5_unwrap += delta; return self._cur5_unwrap
+        else:
+            if self._cur6_unwrap is None: self._cur6_unwrap = ccw_mod
+            delta = self._shortest_ccw_diff(self._cur6_unwrap % 360.0, ccw_mod)
+            self._cur6_unwrap += delta; return self._cur6_unwrap
+
+    @staticmethod
+    def _nearest_equivalent(current_unwrapped: float, desired_mod: float) -> float:
+        base = ((desired_mod + 180.0) % 360.0) - 180.0
+        k = round((current_unwrapped - base) / 360.0)
+        return base + 360.0 * k
+
+    @staticmethod
+    def _shortest_ccw_diff(cur_mod: float, target_mod: float) -> float:
+        return (target_mod - cur_mod + 540.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _cw_to_ccw(cw_deg: float) -> float:
+        return (-cw_deg) % 360.0
+
+    def _all_off_and_stop(self) -> None:
+        self._lamp_green.off(); self._lamp_red.off(); self._lamp_yellow.off()
+        self._s1.stop(); self._s2.stop(); self._s3.stop(); self._s4.stop(); self._s5.stop(); self._s6.stop()
+
+    # ---- Blink handling (limit) ----
+    def _start_blink(self) -> None:
+        if not self._blink.isActive():
+            self._red_on_for_blink = False; self._blink.start()
+        self._toggle_red()
+
+    def _stop_blink(self, reset: bool) -> None:
+        if self._blink.isActive(): self._blink.stop()
+        if reset: self._lamp_red.off(); self._red_on_for_blink = False
+
+    def _toggle_red(self) -> None:
+        self._red_on_for_blink = not self._red_on_for_blink
+        if self._red_on_for_blink: self._lamp_red.on(self._RED)
+        else: self._lamp_red.off()
+
+# ============================================================
+# 4) Arm input window — mechanics unchanged; draws gripper
+# ============================================================
+
+class RoboticArmInput(QtWidgets.QWidget):
+    def __init__(self, controller: Controller, parent=None):
+        super().__init__(parent); self._ctrl = controller
+        self._ground_margin = 12; self._base_x = 110
+        self._link1 = 70; self._link2 = 60; self._link3 = 35  # short forearm
+        self._joint_r = 4; self._link_w = 12
+        self._active_joint: Optional[str] = None
+        self._hover_joint: Optional[str] = None
+
+        # timer for repaint
+        self._timer = QtCore.QTimer(self); self._timer.setInterval(ANIM_DT_MS)
+        self._timer.timeout.connect(self.update); self._timer.start()
+
+        # capture mouse + Enter
+        self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        self.setMinimumSize(260, 240)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        # Gripper geometry (visual only; aligned with link3)
+        self._grip_length = 20
+        self._grip_width  = 4
+        self._grip_open_gap = 9
+        self._grip_closed_gap = 2
+
+    def sizeHint(self) -> QtCore.QSize: return QtCore.QSize(280, 250)
+
+    def _angles(self) -> Tuple[float, float, float]:
+        a1 = Controller._cw_to_ccw(self._ctrl._s1.get_angle_deg())
+        a2 = Controller._cw_to_ccw(self._ctrl._s2.get_angle_deg())
+        a3 = Controller._cw_to_ccw(self._ctrl._s3.get_angle_deg())
+        return a1, a2, a3
+
+    def _fk(self):
+        W = self.width(); H = self.height()
+        base = QtCore.QPointF(self._base_x, H - self._ground_margin - self._joint_r)
+        a1, a2, a3 = self._angles()
+
+        ex = self._link1 * math.sin(math.radians(a1))
+        ey = -self._link1 * math.cos(math.radians(a1))
+        elbow = QtCore.QPointF(base.x()+ex, base.y()+ey)
+
+        a12 = a1 + a2
+        wx = self._link2 * math.sin(math.radians(a12))
+        wy = -self._link2 * math.cos(math.radians(a12))
+        wrist = QtCore.QPointF(elbow.x()+wx, elbow.y()+wy)
+
+        a123 = a12 + a3
+        tx = self._link3 * math.sin(math.radians(a123))
+        ty = -self._link3 * math.cos(math.radians(a123))
+        tip = QtCore.QPointF(wrist.x()+tx, wrist.y()+ty)
+
+        return base, elbow, wrist, tip, a1, a12, a123
+
+    def _pick_joint(self, pos: QtCore.QPointF) -> Optional[str]:
+        base, elbow, wrist, tip, *_ = self._fk()
+
+        def dseg(P, A, B):
+            ax, ay, bx, by, px, py = A.x(),A.y(),B.x(),B.y(),pos.x(),pos.y()
+            abx,aby = bx-ax, by-ay; ab2 = abx*abx+aby*aby
+            if ab2==0: return math.hypot(px-ax, py-ay)
+            t = max(0.0, min(1.0, ((px-ax)*abx+(py-ay)*aby)/ab2))
+            qx,qy = ax+t*abx, ay+t*aby; return math.hypot(px-qx, py-qy)
+
+        d1 = dseg(pos, base, elbow)
+        d2 = dseg(pos, elbow, wrist)
+        d3 = dseg(pos, wrist, tip)
+
+        mind = min(d1, d2, d3)
+        if mind > 40.0: return None
+        if mind == d1: return 'lower'
+        if mind == d2: return 'upper'
+        return 'wrist'
+
+    def keyPressEvent(self, ev: QtGui.QKeyEvent) -> None:
+        if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            self._ctrl.toggle_gripper()
+            ev.accept(); return
+        super().keyPressEvent(ev)
+
+    def mousePressEvent(self, ev: QtGui.QMouseEvent) -> None:
+        self._active_joint = self._pick_joint(ev.position())
+        if self._active_joint == 'lower':
+            self._ctrl.start_drag_lower()
+        elif self._active_joint == 'upper':
+            self._ctrl.start_drag_upper()
+        elif self._active_joint == 'wrist':
+            self._ctrl.start_drag_wrist()
+        ev.accept()
+
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent) -> None:
+        pos = ev.position(); self._hover_joint = self._pick_joint(pos)
+        base, elbow, wrist, tip, a1, a12, a123 = self._fk()
+        if self._active_joint is None:
+            self.update(); return
+
+        if self._active_joint == 'lower':
+            dx = pos.x()-base.x(); dy = pos.y()-base.y()
+            theta1_mod = math.degrees(math.atan2(dx, -dy))  # CCW from vertical [-180,180]
+            self._ctrl.update_cursor_lower(theta1_mod)
+        elif self._active_joint == 'upper':
+            dx = pos.x()-elbow.x(); dy = pos.y()-elbow.y()
+            absolute = math.degrees(math.atan2(dx, -dy))
+            self._ctrl.update_cursor_upper(absolute - a1)
+        else:  # wrist
+            dx = pos.x()-wrist.x(); dy = pos.y()-wrist.y()
+            absolute = math.degrees(math.atan2(dx, -dy))
+            self._ctrl.update_cursor_wrist(absolute - a12)
+        self.update()
+
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent) -> None:
+        self._active_joint = None
+        self._ctrl.end_drag()
+        self.update(); ev.accept()
+
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        W = self.width(); H = self.height()
+        p.fillRect(self.rect(), QtGui.QColor(18,18,20))
+        gy = H - self._ground_margin; p.setPen(QtGui.QPen(QtGui.QColor(30,30,30),3))
+        p.drawLine(20, gy, W-20, gy)
+
+        base, elbow, wrist, tip, a1, a12, a123 = self._fk()
+
+        def draw_link(A,B,hl):
+            dx,dy = B.x()-A.x(), B.y()-A.y(); L = math.hypot(dx,dy); ang = math.degrees(math.atan2(dy,dx))
+            p.save(); p.translate(A); p.rotate(ang)
+            edge = QtGui.QColor(70,130,255) if hl else QtGui.QColor(25,25,25)
+            p.setPen(QtGui.QPen(edge,2)); p.setBrush(QtGui.QBrush(QtGui.QColor(160,160,160)))
+            p.drawRoundedRect(QtCore.QRectF(0,-self._link_w/2, L, self._link_w), 6, 6); p.restore()
+
+        hl_lower = (self._hover_joint=='lower') or (self._active_joint=='lower')
+        hl_upper = (self._hover_joint=='upper') or (self._active_joint=='upper')
+        hl_wrist = (self._hover_joint=='wrist') or (self._active_joint=='wrist')
+
+        draw_link(base, elbow, hl_lower)
+        draw_link(elbow, wrist, hl_upper)
+        draw_link(wrist, tip, hl_wrist)
+
+        def draw_joint(C,label):
+            r = self._joint_r
+            p.setPen(QtGui.QPen(QtGui.QColor(120,200,235),3))
+            p.setBrush(QtGui.QBrush(QtGui.QColor(36,128,158)))
+            p.drawEllipse(QtCore.QRectF(C.x()-r, C.y()-r, 2*r, 2*r))
+            f = p.font(); f.setPointSize(10); p.setFont(f)
+            p.setPen(QtGui.QPen(QtGui.QColor(230,230,230)))
+            w = QtGui.QFontMetrics(f).horizontalAdvance(label)
+            p.drawText(int(C.x()-w/2), int(C.y()+r+16), label)
+        draw_joint(base,"Motor 1"); draw_joint(elbow,"Motor 2"); draw_joint(wrist,"Motor 3")
+
+        # --- Gripper (two parallel sticks) aligned with link3; vertical by default ---
+        gap = self._grip_closed_gap if self._ctrl.is_gripper_closed() else self._grip_open_gap
+        p.save()
+        p.translate(tip)
+        ang3 = math.degrees(math.atan2(tip.y() - wrist.y(), tip.x() - wrist.x()))
+        p.rotate(ang3)
+        p.setPen(QtGui.QPen(QtGui.QColor(25,25,25),2))
+        p.setBrush(QtGui.QBrush(QtGui.QColor(190,190,190)))
+        off = gap/2.0
+        p.save(); p.translate(0, -off); p.drawRect(QtCore.QRectF(0, -self._grip_width/2, self._grip_length, self._grip_width)); p.restore()
+        p.save(); p.translate(0, +off); p.drawRect(QtCore.QRectF(0, -self._grip_width/2, self._grip_length, self._grip_width)); p.restore()
+        p.restore()
+
+# ============================================================
+# 4.5) Spin input panel (yaw & roll) — unchanged behavior
+# ============================================================
+
+class SpinInputPanel(QtWidgets.QWidget):
+    def __init__(self, controller: Controller, parent=None):
+        super().__init__(parent); self._ctrl = controller
+        self.setMinimumSize(120, 220)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        self._active: Optional[str] = None  # 'yaw' | 'roll' | None
+        self._R = 40  # disk radius
+
+        self._yaw_vis = 0.0; self._roll_vis = 0.0
+        self._yaw_cum = 0.0; self._roll_cum = 0.0
+        self._yaw_last_raw: Optional[float] = None
+        self._roll_last_raw: Optional[float] = None
+
+        rpm_max = getattr(self._ctrl._cfg, "rpm_max", 60.0)
+        self._deg_per_sec = 6.0 * float(rpm_max)
+        self._yaw_last_t: Optional[float] = None
+        self._roll_last_t: Optional[float] = None
+
+        self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        self._lim = getattr(self._ctrl._cfg, "spin_limit_deg", 360.0)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(130, 230)
+
+    @staticmethod
+    def _angle_from_up(center: QtCore.QPointF, pos: QtCore.QPointF) -> float:
+        dx = pos.x()-center.x(); dy = pos.y()-center.y()
+        return math.degrees(math.atan2(dx, -dy))
+
+    @staticmethod
+    def _shortest_ccw_diff(a: float, b: float) -> float:
+        return (b - a + 540.0) % 360.0 - 180.0
+
+    def _centers(self) -> Tuple[QtCore.QPointF, QtCore.QPointF]:
+        W = self.width(); H = self.height()
+        cx = W//2
+        top = QtCore.QPointF(cx, 60)
+        bot = QtCore.QPointF(cx, 170)
+        return top, bot
+
+    def _pick(self, pos: QtCore.QPointF) -> Optional[str]:
+        top, bot = self._centers()
+        if (QtCore.QLineF(pos, top).length() <= self._R): return 'yaw'
+        if (QtCore.QLineF(pos, bot).length() <= self._R): return 'roll'
+        return None
+
+    def mousePressEvent(self, ev: QtGui.QMouseEvent) -> None:
+        self._active = self._pick(ev.position())
+        if self._active == 'yaw':
+            self._ctrl.start_drag_yaw()
+            top, _ = self._centers()
+            self._yaw_last_raw = self._angle_from_up(top, ev.position())
+            self._yaw_last_t = time.time()
+        elif self._active == 'roll':
+            self._ctrl.start_drag_roll()
+            _, bot = self._centers()
+            self._roll_last_raw = self._angle_from_up(bot, ev.position())
+            self._roll_last_t = time.time()
+        self.setFocus(); ev.accept()
+
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent) -> None:
+        pos = ev.position()
+        top, bot = self._centers()
+
+        if self._active == 'yaw':
+            raw = self._angle_from_up(top, pos)
+            now = time.time()
+            if self._yaw_last_raw is None: self._yaw_last_raw = raw
+            if self._yaw_last_t is None:   self._yaw_last_t = now
+
+            delta_raw = self._shortest_ccw_diff(self._yaw_last_raw, raw)
+
+            elapsed = max(0.0, now - self._yaw_last_t)
+            max_step = self._deg_per_sec * elapsed
+            if   delta_raw >  max_step: delta =  max_step
+            elif delta_raw < -max_step: delta = -max_step
+            else:                        delta =  delta_raw
+
+            proposed = self._yaw_cum + delta
+            if proposed >  self._lim: proposed =  self._lim
+            if proposed < -self._lim: proposed = -self._lim
+
+            pushing_beyond = ((self._yaw_cum >=  self._lim and delta > 0) or
+                              (self._yaw_cum <= -self._lim and delta < 0))
+            if pushing_beyond:
+                kick = (self._lim + 1.0) if delta > 0 else (-self._lim - 1.0)
+                self._ctrl.update_cursor_yaw(kick)
+                self._yaw_cum = proposed; self._yaw_vis = proposed
+                self._yaw_last_raw = raw; self._yaw_last_t = now
+                self.update(); return
+
+            self._yaw_cum = proposed; self._yaw_vis = proposed
+            self._ctrl.update_cursor_yaw(self._yaw_cum)
+            self._yaw_last_raw = raw; self._yaw_last_t = now
+            self.update()
+
+        elif self._active == 'roll':
+            raw = self._angle_from_up(bot, pos)
+            now = time.time()
+            if self._roll_last_raw is None: self._roll_last_raw = raw
+            if self._roll_last_t is None:   self._roll_last_t = now
+
+            delta_raw = self._shortest_ccw_diff(self._roll_last_raw, raw)
+
+            elapsed = max(0.0, now - self._roll_last_t)
+            max_step = self._deg_per_sec * elapsed
+            if   delta_raw >  max_step: delta =  max_step
+            elif delta_raw < -max_step: delta = -max_step
+            else:                        delta =  delta_raw
+
+            proposed = self._roll_cum + delta
+            if proposed >  self._lim: proposed =  self._lim
+            if proposed < -self._lim: proposed = -self._lim
+
+            pushing_beyond = ((self._roll_cum >=  self._lim and delta > 0) or
+                              (self._roll_cum <= -self._lim and delta < 0))
+            if pushing_beyond:
+                kick = (self._lim + 1.0) if delta > 0 else (-self._lim - 1.0)
+                self._ctrl.update_cursor_roll(kick)
+                self._roll_cum = proposed; self._roll_vis = proposed
+                self._roll_last_raw = raw; self._roll_last_t = now
+                self.update(); return
+
+            self._roll_cum = proposed; self._roll_vis = proposed
+            self._ctrl.update_cursor_roll(self._roll_cum)
+            self._roll_last_raw = raw; self._roll_last_t = now
+            self.update()
+
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent) -> None:
+        was = self._active
+        if was == 'yaw':
+            self._ctrl.update_cursor_yaw(self._yaw_cum)
+        elif was == 'roll':
+            self._ctrl.update_cursor_roll(self._roll_cum)
+
+        self._active = None
+        self._yaw_last_raw = None; self._roll_last_raw = None
+        self._yaw_last_t = None;   self._roll_last_t = None
+        self._ctrl.end_drag()
+        self.update(); ev.accept()
+
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QtGui.QColor(18,18,20))
+
+        top, bot = self._centers()
+        for (C, label, ang) in (
+            (top, "Base joint", self._yaw_vis),
+            (bot, "Grippers turn", self._roll_vis),
+        ):
+            p.setPen(QtGui.QPen(QtGui.QColor(30,30,30), 3))
+            p.setBrush(QtGui.QBrush(QtGui.QColor(240,240,240)))
+            p.drawEllipse(QtCore.QPointF(C), self._R, self._R)
+
+            p.save(); p.translate(C); p.rotate(ang)
+            p.setPen(QtGui.QPen(QtGui.QColor(10,10,10), 2))
+            p.setBrush(QtGui.QBrush(QtGui.QColor(10,10,10)))
+            shaft = QtCore.QRectF(-2.5, -self._R*0.65, 5, self._R*0.65)
+            p.drawRect(shaft)
+            tri = QtGui.QPolygonF([QtCore.QPointF(0, -self._R*0.85),
+                                   QtCore.QPointF(10, -self._R*0.65),
+                                   QtCore.QPointF(-10, -self._R*0.65)])
+            p.drawPolygon(tri)
+            p.restore()
+
+            f = p.font(); f.setPointSize(10); p.setFont(f)
+            p.setPen(QtGui.QPen(QtGui.QColor(230,230,230)))
+            w = QtGui.QFontMetrics(f).horizontalAdvance(label)
+            p.drawText(int(C.x()-w/2), int(C.y()+self._R+18), label)
+
+# ============================================================
+# 4.6) Composite: Arm + Spin panel side by side (unchanged)
+# ============================================================
+
+class ArmWithSpin(QtWidgets.QWidget):
+    """Left: RoboticArmInput; Right: SpinInputPanel (same window)."""
+    def __init__(self, controller: Controller, parent=None):
+        super().__init__(parent)
+        layout = QtWidgets.QHBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0)
+        self._arm = RoboticArmInput(controller)
+        self._spin = SpinInputPanel(controller)
+        layout.addWidget(self._arm, 1)
+        layout.addWidget(self._spin, 0)
+
+    def sizeHint(self) -> QtCore.QSize:
+        s = self._arm.sizeHint()
+        return QtCore.QSize(s.width()+130, max(s.height(), 230))
+
+# ============================================================
+# 5) NEW: Log panel (green on black, bottom-up scrolling)
+# ============================================================
+
+class LogPanel(QtWidgets.QWidget):
+    def __init__(self, max_lines: int = 20, parent=None):
+        super().__init__(parent)
+        self._bg = QtGui.QColor(10,10,12)
+        self._fg = QtGui.QColor(0, 230, 120)  # green
+
+        # store a long history; show only a window of it
+        self._history_limit = 2000
+        self._lines: deque[tuple[str, QtGui.QColor]] = deque(maxlen=self._history_limit)
+
+        self._margin = 10
+        self._line_h = 18
+
+        # how many lines fit on screen right now
+        self._visible_cap = int(max_lines)
+        # 0 = bottom (live). positive means scrolled up by N lines
+        self._scroll = 0
+        self._scroll_acc = 0.0
+
+        self.setMinimumHeight(self._visible_cap * self._line_h + 2*self._margin)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+        # --- NEW: floating "jump to bottom" button ---
+        self._jump_btn = QtWidgets.QToolButton(self)
+        self._jump_btn.setText("↓")
+        self._jump_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._jump_btn.setFixedSize(40, 40)
+        self._jump_btn.setStyleSheet("""
+            QToolButton {
+                border: none;
+                border-radius: 20px;
+                background: rgba(0,0,0,0.55);
+                color: white;
+                font-size: 20px;
+                box-shadow: 0px 0px 12px rgba(0,0,0,0.35);
+            }
+            QToolButton:hover { background: rgba(0,0,0,0.70); }
+            QToolButton:pressed { background: rgba(0,0,0,0.85); }
+        """)
+        self._jump_btn.setVisible(False)
+        self._jump_btn.clicked.connect(self._jump_to_bottom)
+
+        # tiny timer to animate a very fast scroll-to-bottom
+        self._jump_anim = QtCore.QTimer(self)
+        self._jump_anim.setInterval(10)
+        self._jump_anim.timeout.connect(self._anim_step)
+
+    def add(self, text: str, color: Optional[QtGui.QColor] = None) -> None:
+        if color is None:
+            color = self._fg
+        at_bottom = (self._scroll == 0)
+        self._lines.append((text, color))
+    # keep the same content in view unless we are at the bottom
+        if at_bottom:
+            self._scroll = 0
+        else:
+        # maintain relative view from bottom when history grows
+            self._scroll = min(self._scroll + 0, max(0, len(self._lines) - self._visible_cap))
+        self.update()
+        self._update_jump_visibility()  # NEW
+
+    def wheelEvent(self, e: QtGui.QWheelEvent) -> None:
+    # Natural feel: wheel up => see older lines (increase scroll offset)
+                # High-precision scrolling:
+        #  - use pixelDelta when available (trackpads), map ~40 px → 1 line
+        #  - otherwise fall back to angleDelta notches, map 1 notch → 8 lines
+        pd_y = e.pixelDelta().y()
+        if pd_y:  # trackpad
+            delta_lines_f = (pd_y / 40.0)          # wheel up → older lines (positive)
+        else:     # mouse wheel
+            delta_steps = e.angleDelta().y() / 120.0
+            delta_lines_f = (delta_steps * 8.0)    # more sensitive than before
+
+        # apply integer part, keep fractional remainder to accumulate
+        delta_int = int(delta_lines_f)
+        self._scroll += delta_int
+        self._scroll_acc += (delta_lines_f - delta_int)
+
+        # promote accumulated fractions into whole lines
+        while self._scroll_acc >= 1.0:
+            self._scroll += 1
+            self._scroll_acc -= 1.0
+        while self._scroll_acc <= -1.0:
+            self._scroll -= 1
+            self._scroll_acc += 1.0
+
+        # clamp: 0 = bottom; max = total - visible
+        max_scroll = max(0, len(self._lines) - self._visible_cap)
+        self._scroll = max(0, min(self._scroll, max_scroll))
+
+        self.update()
+        self._update_jump_visibility()  # NEW
+        e.accept()
+
+    def set_lines_by_height(self, height_px: int) -> None:
+        self._visible_cap = max(4, (height_px - 2*self._margin)//self._line_h)
+    # clamp scroll so we never overshoot history
+        self._scroll = min(self._scroll, max(0, len(self._lines) - self._visible_cap))
+        self._update_jump_visibility()  # NEW
+
+    def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
+        self.set_lines_by_height(e.size().height())
+
+        # NEW: place the button — vertically centered, 16px from right
+        s = self._jump_btn.size()
+        x = self.width() - s.width() - 16
+        y = (self.height() - s.height()) // 2
+        self._jump_btn.move(x, y)
+
+        # --- NEW: helpers for the floating "jump to bottom" button ---
+    def _update_jump_visibility(self) -> None:
+        # Show when we've scrolled up far enough that the bottom 3 lines are not visible.
+        self._jump_btn.setVisible(self._scroll > 2)
+
+    def _jump_to_bottom(self) -> None:
+        if self._scroll <= 0:
+            self._scroll = 0
+            self._update_jump_visibility()
+            self.update()
+            return
+        # start a very fast animation downwards
+        if not self._jump_anim.isActive():
+            self._jump_anim.start()
+
+    def _anim_step(self) -> None:
+        # Decrease scroll quickly; larger steps when further away
+        if self._scroll <= 0:
+            self._scroll = 0
+            self._jump_anim.stop()
+            self._update_jump_visibility()
+            self.update()
+            return
+        step = max(2, self._scroll // 3)  # fast but smooth
+        self._scroll = max(0, self._scroll - step)
+        self.update()
+        self._update_jump_visibility()
+
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        p.fillRect(self.rect(), self._bg)
+
+        f = p.font(); f.setPointSize(11); p.setFont(f)
+
+        total = len(self._lines)
+        cap = self._visible_cap
+    # choose the slice to render (from bottom, shifted by _scroll)
+        start = max(0, total - cap - self._scroll)
+        end   = max(0, total - self._scroll)
+        window = list(self._lines)[start:end]
+
+    
+        if self._scroll == 0:
+            y = self.height() - self._margin - self._line_h                  # bottom anchor
+        else:
+        # top anchor: the FIRST line sits at top margin
+            y = self._margin + (len(window) - 1) * self._line_h
+
+        for entry in reversed(window):
+            if isinstance(entry, tuple) and len(entry) == 2:
+                line, col = entry
+                col = col if isinstance(col, QtGui.QColor) else self._fg
+            else:
+                line, col = str(entry), self._fg
+            p.setPen(col)
+            p.drawText(self._margin, y, self.width() - 2*self._margin, self._line_h,
+                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, line)
+            y -= self._line_h
+
+# ============================================================
+# 6) NEW: Unified main window (top lamps/motors, middle log, bottom input)
+# ============================================================
+
+class UnifiedMainWindow(QtWidgets.QMainWindow):
+    @QtCore.Slot(int, int, float)
+    def _on_motor_command(self, motor_id: int, dir_num: int, abs_deg: float) -> None:
+        self._logs.add(f"M{motor_id} {abs_deg:.0f}°") 
+
+        # NEW: if we are still in the startup-centering window, and M4/M5 receive any command,
+        # include them in the completion wait set.
+        if getattr(self, "_await_start_center", False) and motor_id in (4, 5):
+            self._start_center_wait.add(motor_id)
+
+    def _on_reset_clicked(self) -> None:
+        # next final_position for these motors should swap their captions to -270°
+        self._await_reset_done[2] = True
+        self._await_reset_done[3] = True
+        # kick the motion
+        self._ctrl.reset_m23_ccw_360()
+
+    @QtCore.Slot(int, int, float)
+    def _on_limit(self, motor_id: int, dir_num: int, deg_cw: float) -> None:
+        # First time we hit the limit for this motor: print the “fix” position once
+        if self._limit_active_id != motor_id:
+            self._limit_active_id = motor_id
+            self._limit_fix_printed = False
+        if not self._limit_fix_printed:
+            letter = "R" if dir_num == 1 else "L"
+            self._logs.add(f"M{motor_id} {letter} {round(deg_cw)%360}°")
+            self._limit_fix_printed = True
+        # Every overshoot attempt → red LIMIT line
+        self._logs.add(f"MOTOR {motor_id} LIMIT", self._red)
+
+    @QtCore.Slot(int, float)
+    def _on_final_position(self, motor_id: int, deg_cw: float) -> None:
+        # Log final settled angle
+        
+
+        # After the reset_m23_ccw_360 completes, M2/M3 dials show "-270°" once
+        if motor_id in (2, 3) and self._await_reset_done.get(motor_id, False):
+            self._step_by_id[motor_id].set_display_override("-270°")
+            self._await_reset_done[motor_id] = False
+
+        # After home_all_motors completes, all dials show "0°" once
+        if self._await_center_done.get(motor_id, False):
+            self._step_by_id[motor_id].set_display_override("0°")
+            self._await_center_done[motor_id] = False
+
+        # --- NEW: startup-centering completion (M2–M5; M4/M5 only if they moved) ---
+        if getattr(self, "_await_start_center", False):
+            if motor_id in self._start_center_wait:
+                self._start_center_done.add(motor_id)
+                if self._start_center_done.issuperset(self._start_center_wait):
+                    self._logs.add("All motors centered (M2-M5)", self._blue)
+                    self._await_start_center = False  # done; don’t repeat
+
+        # NEW: when centering (M2–M5) finishes, emit one blue line
+        if getattr(self, "_center_wait", None):
+            if motor_id in self._center_wait:
+                self._center_wait.discard(motor_id)
+                if not self._center_wait:
+                    self._logs.add("All motors centered (M2-M5)", QtGui.QColor(100, 180, 255))
+                    self._center_wait = set()  # reset
+    
+    @QtCore.Slot()
+    def _on_centering_complete(self) -> None:
+        """Log completion of M2/M3 auto-centering in light blue."""
+        light_blue = QtGui.QColor(100, 180, 255)
+        self._logs.add("M2 and M3 centered", light_blue)
+    
+    def _on_center_clicked(self) -> None:
+        # call controller to compute & issue all neutral commands at once
+        self._ctrl.home_all_motors()
+
+        # mark all motors so that when they finish and emit final_position,
+        # we override their captions to "0°" once
+        self._await_center_done = {1: True, 2: True, 3: True, 4: True, 5: True, 6: True}
+        self._center_wait = {2, 3, 4, 5}
+
+
+    def __init__(self, device: SimDevice):
+        super().__init__()
+        self.setWindowTitle("Robot — Output (top) • Logs (middle) • Input (bottom)")
+        central = QtWidgets.QWidget(); self.setCentralWidget(central)
+        self._root = QtWidgets.QVBoxLayout(central)  # keep for later replacement
+        self._root.setContentsMargins(12,12,12,12); self._root.setSpacing(10)
+
+        # ---------- TOP BAND: lamps (small) above motors ----------
+        top_band = QtWidgets.QVBoxLayout(); top_band.setSpacing(8)
+        head_col = QtWidgets.QVBoxLayout()
+        head_col.setSpacing(14)  # 14px ≈ half of 28px button height
+
+        # Top button: Reset (existing behavior)
+        self._reset_btn = QtWidgets.QPushButton("Reset")
+        self._reset_btn.setFixedSize(110, 28)
+        self._reset_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._reset_btn.clicked.connect(self._on_reset_clicked)
+        head_col.addWidget(self._reset_btn, 0, QtCore.Qt.AlignLeft)
+
+        # New button: Center
+        self._center_btn = QtWidgets.QPushButton("Center")
+        self._center_btn.setFixedSize(110, 28)
+        self._center_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._center_btn.clicked.connect(self._on_center_clicked)
+        head_col.addWidget(self._center_btn, 0, QtCore.Qt.AlignLeft)
+
+        head_row = QtWidgets.QHBoxLayout()
+        head_row.setSpacing(10)
+        head_row.addLayout(head_col, 0)
+        head_row.addStretch(1)
+
+        top_band.addLayout(head_row)
+        lamps_row = QtWidgets.QHBoxLayout(); lamps_row.setSpacing(12); lamps_row.addStretch(1)
+        lamp_diam_small = 13
+        self._lamp_green = SimLampWidget(diameter=lamp_diam_small, label="Green")
+        self._lamp_yellow = SimLampWidget(diameter=lamp_diam_small, label="Filter")
+        self._lamp_blue   = SimLampWidget(diameter=lamp_diam_small, label="Grip")
+        self._lamp_red    = SimLampWidget(diameter=lamp_diam_small, label="Red")
+        self._await_reset_done = {2: False, 3: False}
+        self._await_center_done = {1: False, 2: False, 3: False, 4: False, 5: False}
+
+        for w in (self._lamp_green, self._lamp_yellow, self._lamp_blue, self._lamp_red):
+            lamps_row.addWidget(w)
+        lamps_row.addStretch(1)
+        top_band.addLayout(lamps_row)
+
+        motors_row = QtWidgets.QHBoxLayout(); motors_row.setSpacing(45); motors_row.addStretch(1)
+        dial_diam = 40
+        self._step1 = SimStepperWidget(diameter=dial_diam, label="M 1")
+        self._step2 = SimStepperWidget(diameter=dial_diam, label="M 2")
+        self._step3 = SimStepperWidget(diameter=dial_diam, label="M 3")
+        self._step4 = SimStepperWidget(diameter=dial_diam, label="M 4")
+        self._step5 = SimStepperWidget(diameter=dial_diam, label="M 5")
+        self._step6 = SimStepperWidget(diameter=dial_diam, label="M 6")
+        for w in (self._step1, self._step2, self._step3, self._step4, self._step5, self._step6):
+            motors_row.addWidget(w)
+        motors_row.addStretch(1)
+        top_band.addLayout(motors_row)
+
+        self._step_by_id = {
+            1: self._step1, 2: self._step2, 3: self._step3, 4: self._step4, 5: self._step5, 6: self._step6
+        }
+
+        self._root.addLayout(top_band, 1)
+
+        # ---------- NEW: Degrees input strip (placeholder; controller binds later) ----------
+        self._deg_input_placeholder = QtWidgets.QWidget()
+        self._deg_input_placeholder.setFixedHeight(36)
+        self._root.addWidget(self._deg_input_placeholder, 0)
+
+
+        # ---------- MIDDLE BAND: logs ----------
+        self._logs = LogPanel(max_lines=5)
+        self._root.addWidget(self._logs, 1)
+
+                # NEW: remember active limit to print the one-time fix line
+        self._limit_active_id: Optional[int] = None
+        self._limit_fix_printed: bool = False
+        self._red = QtGui.QColor(230, 60, 60)
+        self._blue = QtGui.QColor(100, 180, 255)
+        
+        self._await_start_center = True          # only true during the initial centering
+        self._start_center_wait = {2, 3}         # always wait for M2 & M3
+        self._start_center_done = set()          # will fill with motors that finished
+
+       
+
+        # HAL registrations happen NOW (before controller exists)
+        device.register_lamp("lamp_green", self._lamp_green)
+        device.register_lamp("lamp_red",   self._lamp_red)
+        device.register_lamp("lamp_yellow",self._lamp_yellow)
+        device.register_lamp("lamp_blue",  self._lamp_blue)
+        device.register_stepper("stepper_1", self._step1)
+        device.register_stepper("stepper_2", self._step2)
+        device.register_stepper("stepper_3", self._step3)
+        device.register_stepper("stepper_4", self._step4)
+        device.register_stepper("stepper_5", self._step5)
+        device.register_stepper("stepper_6", self._step6)
+
+        
+
+    def bind_controller(self, controller: Controller) -> None:
+        self._ctrl = controller
+        """Attach controller after HAL is registered so Controller.__init__ can fetch them."""
+        # swap placeholder → ArmWithSpin(controller)
+        # swap degrees placeholder → DegreeInputPanel(controller)
+        deg_idx = self._root.indexOf(self._deg_input_placeholder)
+        if deg_idx != -1:
+            self._root.removeWidget(self._deg_input_placeholder)
+            self._deg_input_placeholder.setParent(None)
+        self._deg_inputs = DegreeInputPanel(controller)
+        self._root.insertWidget(1, self._deg_inputs, 0)  # directly below top_band
+
+
+
+# wire log signals
+        controller.motor_started.connect(self._on_motor_started)
+
+
+        # wire log signals
+        controller.motor_started.connect(self._on_motor_started)
+        controller.motor_stopped.connect(self._on_motor_stopped)
+        controller.grip_toggled.connect(self._on_grip)
+
+        # ---- NEW: angle-aware command logs ----
+        controller.motor_command.connect(self._on_motor_command)  # NEW: actually 
+
+        controller.final_position.connect(self._on_final_position)
+        controller.limit_hit.connect(self._on_limit)  # NEW
+        controller.centering_complete.connect(self._on_centering_complete)
+
+    # ----- log helpers -----
+    def _on_motor_started(self, idx: int, direction: int):
+        # NEW: leaving a limit state cancels the limit spam and reset one-time fix
+        if self._limit_active_id == idx:
+            self._limit_active_id = None
+            self._limit_fix_printed = False
+        # if this dial had a one-off caption, return to live angle on movement
+        if idx in self._step_by_id:
+            self._step_by_id[idx].set_display_override(None)
+
+    def _on_motor_stopped(self, idx: int):
+        return
+
+    def _on_grip(self, closed: bool):
+        self._logs.add("Gripper: CLOSED" if closed else "Gripper: OPEN")
+
+   
+# ============================================================
+# 6.9) Arduino link & command sink (PC-side protocol only)
+# ============================================================
+
+class ArduinoLink(QtCore.QObject):
+    """
+    Thin, robust serial line sender using QtSerialPort so we keep the single-Qt event loop.
+    - send_line(str): appends '\n' and writes as UTF-8.
+    - Auto-open on ctor; exposes .is_open() for diagnostics.
+    - Optional debug echo (commented).
+    """
+    _debug = False  # set True to print all TX bytes
+
+    def __init__(self, port: str, baud: int, parent=None):
+        super().__init__(parent)
+        self._port_name = port
+        self._baud = baud
+
+        self._serial = QtSerialPort.QSerialPort(self)
+        self._serial.setPortName(self._port_name)
+        self._serial.setBaudRate(self._baud)
+        self._serial.setDataBits(QtSerialPort.QSerialPort.DataBits.Data8)
+        self._serial.setParity(QtSerialPort.QSerialPort.Parity.NoParity)
+        self._serial.setStopBits(QtSerialPort.QSerialPort.StopBits.OneStop)
+        self._serial.setFlowControl(QtSerialPort.QSerialPort.FlowControl.NoFlowControl)
+
+        if not self._serial.open(QtCore.QIODevice.WriteOnly):
+            raise RuntimeError(f"Failed to open serial {self._port_name} @ {self._baud}: {self._serial.errorString()}")
+
+        # Optional: small timer to flush; Qt handles buffering already.
+        # self._flush_timer = QtCore.QTimer(self); self._flush_timer.setInterval(5)
+        # self._flush_timer.timeout.connect(self._serial.flush); self._flush_timer.start()
+
+    def is_open(self) -> bool:
+        return self._serial.isOpen()
+
+    def send_line(self, s: str) -> None:
+        """Write a full line terminated by LF."""
+        if not self._serial.isOpen():
+            # Fail fast; you can add retries if desired
+            raise RuntimeError("Serial port is not open")
+        data = (s + "\n").encode("utf-8", errors="ignore")
+        if self._debug or DEBUG:
+            dlog(f"[TX] {s}")
+        _ = self._serial.write(data)
+        # Optionally force a flush:
+        # self._serial.flush()
+
+
+class ArduinoCommandSink(QtCore.QObject):
+    """
+    Bridges Controller → Arduino:
+      • Motor moves: "M,<id:1-5>,<dir:+1|-1>,<abs_cw_deg:0-360>"
+      • Grip state:  "G,<0|1>"
+      • Lamps:
+          - Green mirror (any CCW motion):   "L,G,<0|1>"
+          - Red mirror (any CW or LIMIT):    "L,R,<0|1|BLINK>"
+          - Blue mirrors grip:               "L,B,<0|1>"
+      • LIMIT behavior: on first limit_hit => "L,R,BLINK"; when any motor starts again => "L,R,0"
+    Notes:
+      - We do not change your motion logic; we only listen to your signals.
+      - 'abs_cw_deg' uses the dial convention (CW-positive), matching your UI dials.
+    """
+    _debug = False  # set True to dump all decisions
+
+    def __init__(self, controller: "Controller", link: ArduinoLink, parent=None):
+        super().__init__(parent)
+        self._ctrl = controller
+        self._link = link
+
+        # Track running directions to aggregate green/red lamps (any CCW → green, any CW → red)
+        # dir map: {motor_id: +1 (CW) | -1 (CCW)}
+        self._running_dir: dict[int, int] = {}
+
+        # Limit blink state: if True we request Arduino to blink red autonomously
+        self._red_blinking = False
+
+        # Last CW degrees we sent per motor (to avoid redundant spam if you wish to extend)
+        self._last_deg_sent = {1: None, 2: None, 3: None, 4: None, 5: None, 6: None}
+
+        # ---- Wire signals from Controller (already emitted by your code) ----
+        controller.motor_command.connect(self._on_motor_command)
+        controller.motor_started.connect(self._on_motor_started)
+        controller.motor_stopped.connect(self._on_motor_stopped)
+        controller.grip_toggled.connect(self._on_grip_toggled)
+        controller.limit_hit.connect(self._on_limit_hit)
+        # final_position is UI/log-oriented; we don't need it to drive hardware.
+
+        # Optional: prime blue lamp to known state at startup
+        self._send_line("L,B,0")
+        self._send_line("L,G,0")
+        self._send_line("L,R,0")
+
+    # -------------------- Signal handlers --------------------
+
+    @QtCore.Slot(int, int, float)
+    def _on_motor_command(self, motor_id: int, dir_num: int, abs_deg_cw: float) -> None:
+        """
+        Your Controller emits this when a buffered commit becomes a target extension.
+        We forward that as an absolute CW angle with direction hint.
+        """
+        # Round to 1 decimal to keep traffic lean but deterministic
+        deg = float(abs_deg_cw) % 360.0
+        msg = f"M,{motor_id},{dir_num},{deg:.1f}"
+        if self._debug or DEBUG:
+            dlog(f"[Sink] motor_command → {msg}")
+        self._send_line(msg)
+
+    @QtCore.Slot(int, int)
+    def _on_motor_started(self, motor_id: int, direction: int) -> None:
+        """
+        Update running dir registry and mirror lamps.
+        Any motor starting cancels LIMIT blink (user resumed control).
+        """
+        self._running_dir[motor_id] = +1 if direction > 0 else -1
+        if self._red_blinking:
+            # Leaving LIMIT state → stop blink, return to steady lamp logic
+            self._send_line("L,R,0")
+            self._red_blinking = False
+        self._sync_motion_lamps()
+
+    @QtCore.Slot(int)
+    def _on_motor_stopped(self, motor_id: int) -> None:
+        if motor_id in self._running_dir:
+            del self._running_dir[motor_id]
+        self._sync_motion_lamps()
+
+    @QtCore.Slot(bool)
+    def _on_grip_toggled(self, closed: bool) -> None:
+        """
+        Grip toggles:
+          - G,1 / G,0 for actuator logic on Arduino
+          - L,B,1 / L,B,0 for the blue LED (2nd RGB diode)
+        """
+        self._send_line(f"G,{1 if closed else 0}")
+        self._send_line(f"L,B,{1 if closed else 0}")
+
+    @QtCore.Slot(int, int, float)
+    def _on_limit_hit(self, motor_id: int, dir_num: int, deg_cw: float) -> None:
+        """
+        Mirror the UI's limit behavior:
+          - Request Arduino to blink red autonomously until movement resumes.
+        """
+        if not self._red_blinking:
+            self._send_line("L,R,BLINK")
+            self._red_blinking = True
+        # We do not change green lamp here; motion is frozen by Controller already.
+
+    # -------------------- Helpers --------------------
+
+    def _sync_motion_lamps(self) -> None:
+        """
+        Green lamp mirrors: ON when any motor is currently moving CCW.
+        Red lamp mirrors:   ON when any motor is currently moving CW
+                            (unless we're in LIMIT blink mode—in that case Arduino blinks itself).
+        """
+        any_ccw = any(v < 0 for v in self._running_dir.values())
+        any_cw  = any(v > 0 for v in self._running_dir.values())
+
+        # Green directly mirrors
+        self._send_line(f"L,G,{1 if any_ccw else 0}")
+
+        # Red steady light only if not blinking due to LIMIT
+        if not self._red_blinking:
+            self._send_line(f"L,R,{1 if any_cw else 0}")
+
+    def _send_line(self, s: str) -> None:
+        try:
+            self._link.send_line(s)
+        except Exception as e:
+            # Optional: you can log to your existing LogPanel by emitting a Qt signal,
+            # but here we keep it local and silent unless debugging.
+            if self._debug or DEBUG:
+                dlog(f"[Sink] send failed: {e}")
+
+# --- ADD NEW WIDGET: DegreeInputPanel (simple strip of five inputs) ---
+class DegreeInputPanel(QtWidgets.QWidget):
+    """
+    Five fields for absolute CW degrees (positive=CW, negative=CCW).
+    Press Enter (or leave the field) to command the move. Values are not
+    auto-normalized in the UI; they stay as typed.
+    """
+    def __init__(self, controller: Controller, parent=None):
+        super().__init__(parent)
+        self._ctrl = controller
+
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        row.addStretch(1)
+
+        self._edits: dict[int, QtWidgets.QLineEdit] = {}
+
+        def add_one(j: int, label: str):
+            box = QtWidgets.QHBoxLayout()
+            lab = QtWidgets.QLabel(label); f = lab.font(); f.setPointSize(10); lab.setFont(f)
+            edit = QtWidgets.QLineEdit("0")
+            edit.setFixedWidth(90)
+            edit.setAlignment(QtCore.Qt.AlignRight)
+            edit.setPlaceholderText("deg")
+            edit.setValidator(QtGui.QDoubleValidator(-999999.0, 999999.0, 2, edit))
+
+            # commit handler (Enter) + when focus leaves (editingFinished)
+            def commit():
+                txt = edit.text().strip()
+                if not txt:
+                    return
+                try:
+                    val = float(txt)
+                except ValueError:
+                    return
+                self._ctrl.command_delta_cw(j, val)
+
+            edit.returnPressed.connect(commit)
+        
+
+            box.addWidget(lab)
+            box.addWidget(edit)
+            row.addLayout(box)
+            self._edits[j] = edit
+
+        add_one(1, "Motor 1:")
+        add_one(2, "Motor 2:")
+        add_one(3, "Motor 3:")
+        add_one(4, "Gripper twist:")
+        add_one(5, "Arm twist:")
+        add_one(6, "Base spin:")
+
+        row.addStretch(1)
+
+# ============================================================
+# 7) Bootstrap
+# ============================================================
+
+def main() -> int:
+    app = QtWidgets.QApplication(sys.argv)
+    device = SimDevice()
+
+    # Build window first so it registers lamps/motors into the device.
+    win = UnifiedMainWindow(device)
+    win.resize(700, 320)
+    win.show()
+
+    # Now the HAL exists → safe to construct Controller.
+    controller = Controller(device, ControllerConfig())
+
+    # Late-bind controller to the window (signals + bottom input).
+    win.bind_controller(controller)
+
+    QtCore.QTimer.singleShot(500, controller.auto_center_all)
+
+        # ----- PC→Arduino wiring (port + baud) -----
+    try:
+        ARDUINO_PORT = "/dev/cu.usbserial-110"   # <-- set this to your Mac device
+        ARDUINO_BAUD = 115200                    # <-- must match Serial.begin(...)
+        link = ArduinoLink(ARDUINO_PORT, ARDUINO_BAUD)
+        sink = ArduinoCommandSink(controller, link)  # subscribes to Controller signals
+        if DEBUG:
+            print("[Arduino] Link established on", ARDUINO_PORT)
+    except Exception as e:
+        print("[Arduino] Serial open failed:", e)
+        # Helpful: list available ports so you can copy the right one
+        try:
+            ports = [p.portName() for p in QtSerialPort.QSerialPortInfo.availablePorts()]
+            print("[Arduino] Available ports:", ", ".join(ports) if ports else "(none)")
+            # Common on macOS: /dev/cu.usbserial-XXXX  or  /dev/cu.usbmodem-XXXX
+        except Exception as ee:
+            print("[Arduino] Could not enumerate ports:", ee)
+
+    return app.exec()
+
+if __name__ == "__main__":
+    sys.exit(main())
